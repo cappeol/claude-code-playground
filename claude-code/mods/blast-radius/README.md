@@ -9,14 +9,24 @@ When Claude calls Bash with one of the commands below, Blast Radius stops the ca
 | Command | What the pane shows |
 |---|---|
 | `rm -r`, `rm -f`, `rm -rf` | The files it would delete, with the count and total size. Globs and `~` are expanded. |
-| `git reset --hard` | The files with uncommitted changes, from `git status --porcelain`, and `git diff --shortstat`. |
+| `git reset --hard` | The files with uncommitted changes, from `git status --porcelain`, and `git diff --shortstat`. With a commit (`git reset --hard origin/main`), also the commits it would drop and the untracked files it would overwrite. |
 | `git checkout -- .`, `git restore .` | The files with unstaged changes. |
 | `git clean` | The untracked paths it would remove, from `git clean -n` with the same flags. |
 | `git push --force` (also `-f`, `--force-with-lease`, `+ref`) | The commits on the remote branch that your HEAD doesn't have, which the push would drop. |
 | `manage.py migrate`, `db:migrate`, `alembic upgrade`, `prisma migrate` | The pending migrations, from the tool's own status command. |
 | any other `migrate` | A note that it can't list the pending migrations for that tool. |
 
-Every other command runs as normal. If the command line moves first, with `cd dir &&`, `pushd`/`popd` or `git -C dir`, Blast Radius measures in that folder. A `cd` inside `( ... )` only applies inside the parentheses, as in the shell.
+Every other command runs as normal. If the command line moves first, with `cd dir &&`, `pushd`/`popd` or `git -C dir`, Blast Radius measures in that folder. A `cd` inside `( ... )` only applies inside the parentheses, as in the shell. A variable set earlier on the same line, as in `S=/some/dir; rm -rf "$S"`, is filled in before measuring, so the pane shows what `/some/dir` holds.
+
+A risky command that puts nothing at risk runs without a pane:
+
+- `rm` that matches no file, or only folders with no files in them.
+- `rm` whose paths are all inside Claude Code's per-user temp folder, `/tmp/claude-<uid>/` (`/private/tmp/claude-<uid>/` on macOS), where Claude keeps its scratch files. The folder itself, and a symlink or `..` that leads out of it, are still held.
+- `git reset --hard`, `git checkout -- .` and `git restore .` with no uncommitted changes to discard. With a commit, as in `git reset --hard origin/main`, it must also drop no commits and overwrite no untracked file.
+- `git clean` whose dry run removes nothing.
+- `git push --force` that drops no commits, after `git ls-remote` confirms the remote branch hasn't moved since your last fetch.
+
+Every risky part of the line must put nothing at risk. Migrations are always held, because some, such as `prisma migrate reset`, change the database with nothing pending.
 
 The patterns it demonstrates:
 
@@ -60,6 +70,7 @@ The second try, after Proceed:
   - Cancel has the focus when the pane opens, so pressing Enter refuses the command rather than running it.
   - An independent review before release found two problems in the measuring step, both fixed. A file named like a `find` action (for example `-delete`) that a glob matched could be read as an action while measuring, so relative paths now go to `find` with `./` in front. And a `cd` earlier on the command line was ignored, so the wrong folder was measured; the mod now follows `cd` and `git -C`. The same review led to smaller fixes: overlapping holds are queued, and the buttons always answer the command shown; an error while holding refuses the command; `git clean -e`, `src:dst` and `HEAD` force pushes are measured correctly; and sizes use `du -k`, which works on macOS as well as Linux.
   - Tested in Claude Code, before those fixes: `rm -rf build` was held for more than 30 seconds, Cancel kept the files and Proceed deleted them; `git reset --hard` listed the two changed files and Cancel kept them; `git clean -fdx` was held. Force pushes and migrations were checked against the command classifier only, not run. The fixes are covered by tests of the classifier, the measuring step and the hold queue, run with Node against a stand-in for Claude Code; they haven't been re-run in a live session.
+  - 0.1.1, false holds. Across 22 sessions of one project, the mod held 24 commands, and 22 of them waited the full 10 minutes. About 4 in 5 put nothing at risk: their panes said "delete nothing: no file matches $S", "discard nothing: no uncommitted changes" or "drops no commits". Most were `S=<scratch folder>; rm -rf "$S"`, measured as a file literally named `$S`. Three changes fix that: a command whose measured blast is empty runs; `VAR=value` set earlier on the line is filled in; and paths in Claude Code's temp folder run. To keep those safe, every risky part of the line is now measured, not only the first; `reset --hard <commit>` also counts dropped commits and the untracked files it would overwrite; and a line is still held when it uses `sudo`, when an earlier part such as `mv` or `git stash pop` can move things into the measured path, or when a risky command is nested where it can't be measured. Tested by running the hook module with Node against a stand-in for `$`, on real folders and repositories: 64 cases, with macOS's bash 3.2. Of the 14 distinct commands held in those sessions, 7 now run; the other 7 are still held, either correctly or because the folders they measured are gone.
 
 ## Run it
 
@@ -112,16 +123,19 @@ No environment variables or configuration.
 
 ## Notes / limitations
 
-- It reads the command text. It doesn't parse shell fully: `$(...)`, aliases, `eval`, `bash -c "..."`, `xargs rm`, `find -delete`, scripts that call `rm`, and wrappers such as `timeout 5 rm`, `doas rm`, `time -p rm` or `env -i rm` aren't caught.
-- Only the first risky part of a command line is measured, and the pane shows the command on one line, cut off if it's long. Proceed runs the whole line as written.
+- It reads the command text. It doesn't parse shell fully: `$(...)`, aliases, `eval`, `bash -c "..."`, `xargs rm`, `find -delete`, scripts that call `rm`, and wrappers such as `timeout 5 rm`, `doas rm`, `time -p rm` or `env -i rm` aren't caught on their own. Next to another risky command, a nested risky `rm` or `git` command keeps the line held.
+- Every risky part of a command line is measured. The pane shows the first part that would change something, and the command on one line, cut off if it's long. Proceed runs the whole line as written.
 - It follows `cd`, `pushd`, `popd` and `git -C` on the same line. `cd -`, and a folder that doesn't exist, can't be measured; the pane says so and still holds the command. Otherwise it starts from the session's working folder.
+- It measures before anything on the line runs. A path that an earlier part creates, such as a probe folder made with `mkdir` and removed at the end, counts as not there yet. An earlier `mv`, `ln`, `rsync`, `xargs`, `eval`, `bash`/`sh`/`zsh`, `find -exec`, or a git command that changes files or branches (`git fetch` and read-only ones don't count) keeps the line held, since it could move something into the measured path.
+- Variables: only `NAME=value` and `export NAME=value` set earlier on the same line are filled in, and only when they surely ran: not after `||`, not inside `if`, a loop, `{ }` or a here-document, and not when a part may change them (`read`, `for`, `unset` ...). A path that uses any other variable, `$(...)`, `~user`, `{a,b}`, `**` or a zsh glob qualifier can't be measured, and is held. A value with `~` in it isn't filled in.
+- The temp folder is `/tmp/claude-<uid>`, with `<uid>` from `id -u`, and only when it is a real folder you own. A command run with `sudo` is always held, because the measuring runs as you.
 - In a narrow terminal the report is drawn in the band above the prompt, which only one mod can use at a time. If another mod that draws there (such as Replay Theater or Token Weather in this folder) takes the band, the Proceed and Cancel buttons may not show, and the command is refused after 10 minutes. Use a wider terminal, or turn the other mod off, when you rely on Blast Radius.
-- One command is held at a time. A second risky call, from a subagent for example, waits until the first is answered.
+- One command is held at a time. A second risky call, from a subagent for example, waits until the first is answered. A call with nothing at risk doesn't wait.
 - It only watches the Bash tool. File edits and other tools aren't held.
 - The `rm` count is approximate: a path matched twice is counted twice, and a file name with a line break is not counted. The list shows the first 10 files. Counts come from `find` and sizes from `du -k`, so a size is the space on disk, to the nearest kilobyte. A very large tree can take a few seconds to measure.
-- The force-push list uses your last fetch of the remote branch. Without one, it can't list the dropped commits, and it says so. When the push names no remote, it assumes `origin`.
+- The force-push list uses your last fetch of the remote branch. Without one, it can't list the dropped commits, and it says so. When the push names no remote, it assumes `origin`. Before a force push runs unasked, `git ls-remote` checks the remote, so that needs network access; without it, the push is held. A push of more than one branch, or one that deletes a branch, is always held.
 - To list pending migrations, it runs the tool's own status command (for example `python3 manage.py showmigrations`), which loads your project's code before you choose Proceed or Cancel. If that fails, the pane says it couldn't list them.
-- A few harmless commands are held too, such as a commit whose message contains `; rm -rf`.
+- A few harmless commands are held too, such as a commit whose message contains `; rm -rf build` while `build` exists.
 - It checks one command at a time. It holds a call, but it doesn't sandbox it: after you press Proceed, the command runs as written.
 - This is a safety net, not a permission system. Use [permission rules](https://code.claude.com/docs/en/settings) for a hard block.
 
